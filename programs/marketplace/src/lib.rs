@@ -1,5 +1,6 @@
 // programs/nft-marketplace/src/lib.rs
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::borsh::try_from_slice_unchecked;
 use anchor_spl::token::{Mint, Token, TokenAccount, MintTo};
 use anchor_spl::associated_token::AssociatedToken;
 use mpl_token_metadata::{
@@ -11,9 +12,10 @@ use mpl_token_metadata::{
         VerifyCollection,
     },
     types::{Collection, Creator, DataV2},
+    state::Metadata as TokenMetadata,
 };
 
-declare_id!("8KzE3LCicxv13iJx2v2V4VQQNWt4QHuvfuH8jxYnkGQ1");
+declare_id!("12LJUQx5mfVfqACGgEac65Xe6PMGnYm5rdaRRcU4HE7V");
 
 #[program]
 pub mod nft_marketplace {
@@ -30,13 +32,35 @@ pub mod nft_marketplace {
         Ok(())
     }
 
+    pub fn create_nft_type(
+        ctx: Context<CreateNFTType>,
+        type_name: String,
+        uri: String,
+        price: u64,
+        max_supply: u64,
+    ) -> Result<()> {
+        let collection = &ctx.accounts.collection;
+        let nft_type = &mut ctx.accounts.nft_type;
+
+        require!(collection.is_active, ErrorCode::CollectionInactive);
+
+        nft_type.collection = collection.key();
+        nft_type.name = type_name;
+        nft_type.uri = uri;
+        nft_type.price = price;
+        nft_type.max_supply = max_supply;
+        nft_type.current_supply = 0;
+        nft_type.bump = ctx.bumps.nft_type;
+
+        msg!("NFT type created under collection: {}", collection.name);
+        Ok(())
+    }
+
     pub fn create_nft_collection(
         ctx: Context<CreateNFTCollection>,
         collection_name: String,
         symbol: String,
         uri: String,
-        max_supply: u64,
-        price: u64,
         royalty: u16,
     ) -> Result<()> {
         let collection = &mut ctx.accounts.collection;
@@ -46,9 +70,6 @@ pub mod nft_marketplace {
         collection.name = collection_name.clone();
         collection.symbol = symbol.clone();
         collection.uri = uri.clone();
-        collection.max_supply = max_supply;
-        collection.current_supply = 0;
-        collection.price = price;
         collection.royalty = royalty;
         collection.mint = ctx.accounts.collection_mint.key();
         collection.is_active = true;
@@ -120,7 +141,7 @@ pub mod nft_marketplace {
             system_program: ctx.accounts.system_program.key(),
             rent: Some(ctx.accounts.rent.key()),
         }.instruction(CreateMasterEditionV3InstructionArgs {
-            max_supply: Some(max_supply),
+            max_supply: Some(0), // Unique collection (0 = unique)
         });
 
         let master_edition_accounts = vec![
@@ -146,19 +167,19 @@ pub mod nft_marketplace {
 
     pub fn mint_nft_from_collection(
         ctx: Context<MintNFTFromCollection>,
-        nft_name: String,
-        nft_uri: String,
+        type_name: String,
     ) -> Result<()> {
         let collection = &mut ctx.accounts.collection;
+        let nft_type = &mut ctx.accounts.nft_type;
         
         require!(collection.is_active, ErrorCode::CollectionInactive);
-        require!(collection.current_supply < collection.max_supply, ErrorCode::CollectionSoldOut);
+        require!(nft_type.current_supply < nft_type.max_supply, ErrorCode::CollectionSoldOut);
 
         // Transfer payment to collection admin
         let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.buyer.key(),
             &collection.admin,
-            collection.price,
+            nft_type.price,
         );
 
         anchor_lang::solana_program::program::invoke(
@@ -189,11 +210,12 @@ pub mod nft_marketplace {
 
         anchor_spl::token::mint_to(cpi_ctx, 1)?;
 
-        // Create NFT metadata
+        // Create NFT metadata (fixed per type)
+        let nft_name = format!("{} #{}", type_name, nft_type.current_supply + 1);
         let metadata_data = DataV2 {
-            name: nft_name.clone(),
+            name: nft_name,
             symbol: collection.symbol.clone(),
-            uri: nft_uri,
+            uri: nft_type.uri.clone(),
             seller_fee_basis_points: collection.royalty,
             creators: Some(vec![Creator {
                 address: collection.admin,
@@ -240,7 +262,8 @@ pub mod nft_marketplace {
             payer: ctx.accounts.buyer.key(),
             collection_mint: ctx.accounts.collection_mint_account.key(),
             collection: ctx.accounts.collection_metadata.key(),
-            collection_master_edition: ctx.accounts.collection_master_edition.key(),
+            collection_master_edition_account: ctx.accounts.collection_master_edition.key(),
+            collection_authority_record: None,
         }
         .instruction();
 
@@ -255,11 +278,132 @@ pub mod nft_marketplace {
 
         anchor_lang::solana_program::program::invoke(&verify_collection_ix, &verify_accounts)?;
 
-        collection.current_supply += 1;
+        nft_type.current_supply += 1;
         
-        msg!("NFT minted: {} (#{}/{})", nft_name, collection.current_supply, collection.max_supply);
+        msg!(
+            "NFT minted: {} - {} (type #{}/{})",
+            collection.name,
+            type_name,
+            nft_type.current_supply,
+            nft_type.max_supply
+        );
         Ok(())
     }
+
+	// Matchmaking: Create a room with an initial stake
+	pub fn create_room(
+		ctx: Context<CreateRoom>,
+		room_id: u64,
+		stake_lamports: u64,
+	) -> Result<()> {
+		require!(stake_lamports > 0, ErrorCode::InsufficientFunds);
+
+		// Require creator to own at least 1 token of the provided NFT mint
+		require!(ctx.accounts.creator_nft_token.amount >= 1, ErrorCode::Unauthorized);
+
+		// Verify that the provided NFT belongs to the expected collection
+		let metadata_account_info = ctx.accounts.nft_metadata.to_account_info();
+		let metadata: TokenMetadata = try_from_slice_unchecked(&metadata_account_info.data.borrow())?;
+		let collection = metadata.collection.ok_or(ErrorCode::Unauthorized)?;
+		require!(collection.key == ctx.accounts.collection_mint.key(), ErrorCode::Unauthorized);
+
+		let room = &mut ctx.accounts.room;
+		room.creator = ctx.accounts.creator.key();
+		room.challenger = None;
+		room.room_id = room_id;
+		room.stake_lamports = stake_lamports;
+		room.status = RoomStatus::Waiting as u8;
+		room.bump = ctx.bumps.room;
+
+		// Transfer stake from creator to the room (escrow)
+		let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
+			&ctx.accounts.creator.key(),
+			&room.key(),
+			stake_lamports,
+		);
+		anchor_lang::solana_program::program::invoke(
+			&transfer_ix,
+			&[
+				ctx.accounts.creator.to_account_info(),
+				room.to_account_info(),
+			],
+		)?;
+
+		Ok(())
+	}
+
+	// Matchmaking: Join a room by matching the stake
+	pub fn join_room(ctx: Context<JoinRoom>) -> Result<()> {
+		let room = &mut ctx.accounts.room;
+		require!(room.status == RoomStatus::Waiting as u8, ErrorCode::RoomNotWaiting);
+		require!(room.challenger.is_none(), ErrorCode::RoomHasChallenger);
+		require!(ctx.accounts.challenger.key() != room.creator, ErrorCode::Unauthorized);
+
+		// Require challenger to own at least 1 token of the provided NFT mint
+		require!(ctx.accounts.challenger_nft_token.amount >= 1, ErrorCode::Unauthorized);
+
+		// Verify that the provided NFT belongs to the expected collection
+		let metadata_account_info = ctx.accounts.nft_metadata.to_account_info();
+		let metadata: TokenMetadata = try_from_slice_unchecked(&metadata_account_info.data.borrow())?;
+		let collection = metadata.collection.ok_or(ErrorCode::Unauthorized)?;
+		require!(collection.key == ctx.accounts.collection_mint.key(), ErrorCode::Unauthorized);
+
+		// Transfer matching stake from challenger to the room escrow
+		let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
+			&ctx.accounts.challenger.key(),
+			&room.key(),
+			room.stake_lamports,
+		);
+		anchor_lang::solana_program::program::invoke(
+			&transfer_ix,
+			&[
+				ctx.accounts.challenger.to_account_info(),
+				room.to_account_info(),
+			],
+		)?;
+
+		room.challenger = Some(ctx.accounts.challenger.key());
+		room.status = RoomStatus::Ongoing as u8;
+		Ok(())
+	}
+
+	// Matchmaking: Resolve room, pay winner (creator for now) and close
+	pub fn resolve_room(ctx: Context<ResolveRoom>) -> Result<()> {
+		let room = &ctx.accounts.room;
+		require!(room.status == RoomStatus::Ongoing as u8, ErrorCode::RoomNotOngoing);
+		require!(ctx.accounts.creator.key() == room.creator, ErrorCode::Unauthorized);
+
+		// Payout all lamports held by room to the creator.
+		let room_lamports = **ctx.accounts.room.to_account_info().lamports.borrow();
+		let rent_exempt = Rent::get()?.minimum_balance(Room::space(None));
+		let transferable = room_lamports.saturating_sub(rent_exempt);
+		if transferable > 0 {
+			let seeds = &[
+				b"room",
+				room.creator.as_ref(),
+				&room.room_id.to_le_bytes(),
+				&[room.bump],
+			];
+			let signer = &[&seeds[..]];
+			let ix = anchor_lang::solana_program::system_instruction::transfer(
+				&ctx.accounts.room.key(),
+				&ctx.accounts.creator.key(),
+				transferable,
+			);
+			anchor_lang::solana_program::program::invoke_signed(
+				&ix,
+				&[
+					ctx.accounts.room.to_account_info(),
+					ctx.accounts.creator.to_account_info(),
+					ctx.accounts.system_program.to_account_info(),
+				],
+				signer,
+			)?;
+		}
+
+		// Status will be set to Closed and Anchor will close the account via close attribute
+		Ok(())
+	}
 }
 
 // Account Structures
@@ -292,7 +436,7 @@ pub struct CreateNFTCollection<'info> {
     #[account(
         init,
         payer = admin,
-        space = 8 + 32 + 4 + collection_name.len() + 4 + 10 + 4 + 200 + 8 + 8 + 8 + 2 + 32 + 1 + 1,
+        space = 8 + 32 + 4 + collection_name.len() + 4 + 10 + 4 + 200 + 2 + 32 + 1 + 1,
         seeds = [b"collection", collection_name.as_bytes()],
         bump
     )]
@@ -354,6 +498,38 @@ pub struct CreateNFTCollection<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(type_name: String)]
+pub struct CreateNFTType<'info> {
+    #[account(
+        mut,
+        seeds = [b"collection", collection.name.as_bytes()],
+        bump = collection.bump,
+    )]
+    pub collection: Account<'info, NFTCollection>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8
+            + 32
+            + 4 + type_name.len()
+            + 4 + 200
+            + 8
+            + 8
+            + 8
+            + 1,
+        seeds = [b"type", collection.key().as_ref(), type_name.as_bytes()],
+        bump,
+    )]
+    pub nft_type: Account<'info, NftType>,
+
+    #[account(mut, constraint = admin.key() == collection.admin)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(type_name: String)]
 pub struct MintNFTFromCollection<'info> {
     #[account(
         mut,
@@ -361,6 +537,18 @@ pub struct MintNFTFromCollection<'info> {
         bump = collection.bump,
     )]
     pub collection: Account<'info, NFTCollection>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"type",
+            collection.key().as_ref(),
+            type_name.as_bytes(),
+        ],
+        bump = nft_type.bump,
+        constraint = nft_type.collection == collection.key(),
+    )]
+    pub nft_type: Account<'info, NftType>,
 
     #[account(
         init,
@@ -436,6 +624,103 @@ pub struct MintNFTFromCollection<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
+#[derive(Accounts)]
+#[instruction(room_id: u64)]
+pub struct CreateRoom<'info> {
+	#[account(
+		init,
+		payer = creator,
+		space = Room::space(None),
+		seeds = [b"room", creator.key().as_ref(), &room_id.to_le_bytes()],
+		bump
+	)]
+	pub room: Account<'info, Room>,
+
+	#[account(mut)]
+	pub creator: Signer<'info>,
+
+	/// CHECK: Mint of an NFT the creator owns
+	pub nft_mint: Account<'info, Mint>,
+
+	/// CHECK: Metadata account of the provided NFT mint
+	#[account(
+		seeds = [
+			b"metadata",
+			token_metadata_program.key().as_ref(),
+			nft_mint.key().as_ref(),
+		],
+		bump,
+		seeds::program = token_metadata_program.key(),
+	)]
+	pub nft_metadata: UncheckedAccount<'info>,
+
+	/// CHECK: Collection mint that rooms should be gated by
+	pub collection_mint: Account<'info, Mint>,
+
+	#[account(
+		constraint = creator_nft_token.owner == creator.key(),
+		constraint = creator_nft_token.mint == nft_mint.key(),
+	)]
+	pub creator_nft_token: Account<'info, TokenAccount>,
+	pub system_program: Program<'info, System>,
+	/// CHECK: Token Metadata Program
+	pub token_metadata_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct JoinRoom<'info> {
+	#[account(mut, has_one = creator, seeds = [b"room", creator.key().as_ref(), &room.room_id.to_le_bytes()], bump = room.bump)]
+	pub room: Account<'info, Room>,
+
+	/// CHECK: only used as seed and authority check
+	pub creator: UncheckedAccount<'info>,
+
+	#[account(mut)]
+	pub challenger: Signer<'info>,
+
+	/// CHECK: Mint of an NFT the challenger owns
+	pub nft_mint: Account<'info, Mint>,
+
+	/// CHECK: Metadata account of the provided NFT mint
+	#[account(
+		seeds = [
+			b"metadata",
+			token_metadata_program.key().as_ref(),
+			nft_mint.key().as_ref(),
+		],
+		bump,
+		seeds::program = token_metadata_program.key(),
+	)]
+	pub nft_metadata: UncheckedAccount<'info>,
+
+	/// CHECK: Collection mint that rooms should be gated by
+	pub collection_mint: Account<'info, Mint>,
+
+	#[account(
+		constraint = challenger_nft_token.owner == challenger.key(),
+		constraint = challenger_nft_token.mint == nft_mint.key(),
+	)]
+	pub challenger_nft_token: Account<'info, TokenAccount>,
+	pub system_program: Program<'info, System>,
+	/// CHECK: Token Metadata Program
+	pub token_metadata_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ResolveRoom<'info> {
+	#[account(
+		mut,
+		close = creator,
+		seeds = [b"room", creator.key().as_ref(), &room.room_id.to_le_bytes()],
+		bump = room.bump
+	)]
+	pub room: Account<'info, Room>,
+
+	#[account(mut)]
+	pub creator: Signer<'info>,
+	pub system_program: Program<'info, System>,
+}
+
 // State Structs
 #[account]
 pub struct Marketplace {
@@ -451,13 +736,57 @@ pub struct NFTCollection {
     pub name: String,
     pub symbol: String,
     pub uri: String,
-    pub max_supply: u64,
-    pub current_supply: u64,
-    pub price: u64,
     pub royalty: u16,
     pub mint: Pubkey,
     pub is_active: bool,
     pub bump: u8,
+}
+
+#[account]
+pub struct NftType {
+    pub collection: Pubkey,
+    pub name: String,
+    pub uri: String,
+    pub price: u64,
+    pub max_supply: u64,
+    pub current_supply: u64,
+    pub bump: u8,
+}
+
+#[account]
+pub struct Room {
+	pub creator: Pubkey,
+	pub challenger: Option<Pubkey>,
+	pub room_id: u64,
+	pub stake_lamports: u64,
+	pub status: u8,
+	pub bump: u8,
+}
+
+impl Room {
+	pub fn space(_name: Option<&str>) -> usize {
+		// discriminator
+		8 +
+		// creator
+		32 +
+		// challenger (Option<Pubkey>) -> 1 + 32
+		1 + 32 +
+		// room_id
+		8 +
+		// stake_lamports
+		8 +
+		// status
+		1 +
+		// bump
+		1
+	}
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum RoomStatus {
+	Waiting = 0,
+	Ongoing = 1,
+	Closed = 2,
 }
 
 #[error_code]
@@ -470,4 +799,10 @@ pub enum ErrorCode {
     InsufficientFunds,
     #[msg("Unauthorized access")]
     Unauthorized,
+	#[msg("Room is not in waiting state")]
+	RoomNotWaiting,
+	#[msg("Room is not in ongoing state")]
+	RoomNotOngoing,
+	#[msg("Room already has a challenger")]
+	RoomHasChallenger,
 }
