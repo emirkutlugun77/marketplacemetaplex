@@ -3,10 +3,10 @@ seeds = false
 skip-lint = false
 
 [programs.localnet]
-nft_marketplace = "12LJUQx5mfVfqACGgEac65Xe6PMGnYm5rdaRRcU4HE7V"
+nft_marketplace = "8KzE3LCicxv13iJx2v2V4VQQNWt4QHuvfuH8jxYnkGQ1"
 
 [programs.devnet]
-nft_marketplace = "12LJUQx5mfVfqACGgEac65Xe6PMGnYm5rdaRRcU4HE7V"
+nft_marketplace = "8KzE3LCicxv13iJx2v2V4VQQNWt4QHuvfuH8jxYnkGQ1"
 
 [registry]
 url = "https://api.apr.dev"

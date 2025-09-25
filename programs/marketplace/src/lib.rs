@@ -12,10 +12,10 @@ use mpl_token_metadata::{
         VerifyCollection,
     },
     types::{Collection, Creator, DataV2},
-    state::Metadata as TokenMetadata,
+    accounts::Metadata as TokenMetadata,
 };
 
-declare_id!("12LJUQx5mfVfqACGgEac65Xe6PMGnYm5rdaRRcU4HE7V");
+declare_id!("8KzE3LCicxv13iJx2v2V4VQQNWt4QHuvfuH8jxYnkGQ1");
 
 #[program]
 pub mod nft_marketplace {
@@ -404,6 +404,93 @@ pub mod nft_marketplace {
 		// Status will be set to Closed and Anchor will close the account via close attribute
 		Ok(())
 	}
+
+    // Presale: initialize with 1-day timer and 845 SOL target
+    pub fn initialize_presale(ctx: Context<InitializePresale>) -> Result<()> {
+        let presale = &mut ctx.accounts.presale;
+        presale.admin = ctx.accounts.admin.key();
+        presale.bump = ctx.bumps.presale;
+        presale.is_active = true;
+        let clock = Clock::get()?;
+        presale.start_ts = clock.unix_timestamp;
+        presale.end_ts = clock.unix_timestamp + 86_400; // 1 day
+        presale.total_raised = 0;
+        presale.target_lamports = 845u64.saturating_mul(1_000_000_000);
+        Ok(())
+    }
+
+    // Presale: restart/reset with 1-day timer; keeps same admin and target
+    pub fn restart_presale(ctx: Context<RestartPresale>) -> Result<()> {
+        let presale = &mut ctx.accounts.presale;
+        require!(ctx.accounts.admin.key() == presale.admin, ErrorCode::Unauthorized);
+
+        let clock = Clock::get()?;
+        presale.is_active = true;
+        presale.start_ts = clock.unix_timestamp;
+        presale.end_ts = clock.unix_timestamp + 86_400; // 1 day
+        presale.total_raised = 0;
+        Ok(())
+    }
+
+    // Presale: contribute SOL and record contributor
+    pub fn contribute_presale(ctx: Context<ContributePresale>, lamports: u64) -> Result<()> {
+        require!(lamports > 0, ErrorCode::InsufficientFunds);
+
+        let presale = &mut ctx.accounts.presale;
+        require!(presale.is_active, ErrorCode::PresaleNotActive);
+        let clock = Clock::get()?;
+        require!(clock.unix_timestamp <= presale.end_ts, ErrorCode::PresaleEnded);
+
+        // Transfer SOL from contributor to the presale PDA (escrow)
+        let ix = anchor_lang::solana_program::system_instruction::transfer(
+            &ctx.accounts.contributor.key(),
+            &presale.key(),
+            lamports,
+        );
+        anchor_lang::solana_program::program::invoke(
+            &ix,
+            &[
+                ctx.accounts.contributor.to_account_info(),
+                presale.to_account_info(),
+            ],
+        )?;
+
+        // Track contribution amount per contributor (accumulates)
+        let contrib = &mut ctx.accounts.contribution;
+        contrib.presale = presale.key();
+        contrib.contributor = ctx.accounts.contributor.key();
+        contrib.amount = contrib.amount.saturating_add(lamports);
+        contrib.bump = ctx.bumps.contribution;
+
+        presale.total_raised = presale.total_raised.saturating_add(lamports);
+        Ok(())
+    }
+
+    // Presale: end and withdraw funds to admin after timer or if target reached
+    pub fn end_presale(ctx: Context<EndPresale>) -> Result<()> {
+        let presale = &mut ctx.accounts.presale;
+        require!(presale.is_active, ErrorCode::PresaleNotActive);
+        require!(ctx.accounts.admin.key() == presale.admin, ErrorCode::Unauthorized);
+
+        let clock = Clock::get()?;
+        let reached_time = clock.unix_timestamp >= presale.end_ts;
+        let reached_target = presale.total_raised >= presale.target_lamports;
+        require!(reached_time || reached_target, ErrorCode::PresaleNotEnded);
+
+        // Transfer lamports by directly adjusting balances (source has data)
+        let presale_info = presale.to_account_info();
+        let admin_info = ctx.accounts.admin.to_account_info();
+        let presale_lamports = **presale_info.lamports.borrow();
+        let rent_exempt = Rent::get()?.minimum_balance(Presale::space());
+        let transferable = presale_lamports.saturating_sub(rent_exempt);
+        if transferable > 0 {
+            **presale_info.try_borrow_mut_lamports()? -= transferable;
+            **admin_info.try_borrow_mut_lamports()? += transferable;
+        }
+
+        presale.is_active = false;
+        Ok(())
+    }
 }
 
 // Account Structures
@@ -731,6 +818,52 @@ pub struct Marketplace {
 }
 
 #[account]
+pub struct Presale {
+    pub admin: Pubkey,
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub total_raised: u64,
+    pub target_lamports: u64,
+    pub is_active: bool,
+    pub bump: u8,
+}
+
+impl Presale {
+    pub fn space() -> usize {
+        // discriminator
+        8 +
+        // admin
+        32 +
+        // start_ts
+        8 +
+        // end_ts
+        8 +
+        // total_raised
+        8 +
+        // target_lamports
+        8 +
+        // is_active
+        1 +
+        // bump
+        1
+    }
+}
+
+#[account]
+pub struct PresaleContribution {
+    pub presale: Pubkey,
+    pub contributor: Pubkey,
+    pub amount: u64,
+    pub bump: u8,
+}
+
+impl PresaleContribution {
+    pub fn space() -> usize {
+        8 + 32 + 32 + 8 + 1
+    }
+}
+
+#[account]
 pub struct NFTCollection {
     pub admin: Pubkey,
     pub name: String,
@@ -805,4 +938,66 @@ pub enum ErrorCode {
 	RoomNotOngoing,
 	#[msg("Room already has a challenger")]
 	RoomHasChallenger,
+    #[msg("Presale is not active")]
+    PresaleNotActive,
+    #[msg("Presale has ended")]
+    PresaleEnded,
+    #[msg("Presale cannot be ended yet")]
+    PresaleNotEnded,
+}
+
+// Accounts for presale
+#[derive(Accounts)]
+pub struct InitializePresale<'info> {
+    #[account(
+        init,
+        payer = admin,
+        space = Presale::space(),
+        seeds = [b"presale"],
+        bump
+    )]
+    pub presale: Account<'info, Presale>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ContributePresale<'info> {
+    #[account(mut, seeds = [b"presale"], bump = presale.bump)]
+    pub presale: Account<'info, Presale>,
+
+    #[account(
+        init_if_needed,
+        payer = contributor,
+        space = PresaleContribution::space(),
+        seeds = [b"contrib", presale.key().as_ref(), contributor.key().as_ref()],
+        bump
+    )]
+    pub contribution: Account<'info, PresaleContribution>,
+
+    #[account(mut)]
+    pub contributor: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct EndPresale<'info> {
+    #[account(mut, seeds = [b"presale"], bump = presale.bump)]
+    pub presale: Account<'info, Presale>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RestartPresale<'info> {
+    #[account(mut, seeds = [b"presale"], bump = presale.bump)]
+    pub presale: Account<'info, Presale>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
