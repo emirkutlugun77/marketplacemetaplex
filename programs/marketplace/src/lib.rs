@@ -15,7 +15,7 @@ use mpl_token_metadata::{
     accounts::Metadata as TokenMetadata,
 };
 
-declare_id!("8KzE3LCicxv13iJx2v2V4VQQNWt4QHuvfuH8jxYnkGQ1");
+declare_id!("ptcbSp1UEqYLmod2jgFxGPZnFMqBECcrRyU1fTmnJ5b");
 
 #[program]
 pub mod nft_marketplace {
@@ -38,11 +38,13 @@ pub mod nft_marketplace {
         uri: String,
         price: u64,
         max_supply: u64,
+        stake_multiplier: u64,
     ) -> Result<()> {
         let collection = &ctx.accounts.collection;
         let nft_type = &mut ctx.accounts.nft_type;
 
         require!(collection.is_active, ErrorCode::CollectionInactive);
+        require!(stake_multiplier > 0, ErrorCode::InvalidStakeMultiplier);
 
         nft_type.collection = collection.key();
         nft_type.name = type_name;
@@ -50,6 +52,7 @@ pub mod nft_marketplace {
         nft_type.price = price;
         nft_type.max_supply = max_supply;
         nft_type.current_supply = 0;
+        nft_type.stake_multiplier = stake_multiplier;
         nft_type.bump = ctx.bumps.nft_type;
 
         msg!("NFT type created under collection: {}", collection.name);
@@ -491,6 +494,186 @@ pub mod nft_marketplace {
         presale.is_active = false;
         Ok(())
     }
+
+    // Staking: Initialize the staking pool with reward token and rate
+    pub fn initialize_stake_pool(
+        ctx: Context<InitializeStakePool>,
+        reward_rate_per_second: u64, // Reward tokens per second (base rate before multiplier)
+    ) -> Result<()> {
+        let stake_pool = &mut ctx.accounts.stake_pool;
+        stake_pool.admin = ctx.accounts.admin.key();
+        stake_pool.reward_token_mint = ctx.accounts.reward_token_mint.key();
+        stake_pool.reward_rate_per_second = reward_rate_per_second;
+        stake_pool.total_staked = 0;
+        stake_pool.bump = ctx.bumps.stake_pool;
+
+        msg!("Stake pool initialized with reward rate: {} tokens/second", reward_rate_per_second);
+        Ok(())
+    }
+
+    // Staking: Stake an NFT into the vault
+    pub fn stake_nft(ctx: Context<StakeNFT>) -> Result<()> {
+        let stake_account = &mut ctx.accounts.stake_account;
+        let nft_type = &ctx.accounts.nft_type;
+        let stake_pool = &mut ctx.accounts.stake_pool;
+
+        // Verify NFT metadata belongs to the collection
+        let metadata_account_info = ctx.accounts.nft_metadata.to_account_info();
+        let metadata: TokenMetadata = try_from_slice_unchecked(&metadata_account_info.data.borrow())?;
+        let collection = metadata.collection.ok_or(ErrorCode::InvalidNFTMint)?;
+        require!(collection.key == ctx.accounts.collection.mint, ErrorCode::InvalidNFTMint);
+
+        let clock = Clock::get()?;
+
+        // Initialize stake account
+        stake_account.owner = ctx.accounts.staker.key();
+        stake_account.nft_mint = ctx.accounts.nft_mint.key();
+        stake_account.nft_type = nft_type.key();
+        stake_account.stake_pool = stake_pool.key();
+        stake_account.stake_timestamp = clock.unix_timestamp;
+        stake_account.last_claim_timestamp = clock.unix_timestamp;
+        stake_account.stake_multiplier = nft_type.stake_multiplier;
+        stake_account.bump = ctx.bumps.stake_account;
+
+        // Transfer NFT from staker to vault
+        let transfer_cpi_accounts = anchor_spl::token::Transfer {
+            from: ctx.accounts.staker_nft_token_account.to_account_info(),
+            to: ctx.accounts.vault_nft_token_account.to_account_info(),
+            authority: ctx.accounts.staker.to_account_info(),
+        };
+        let transfer_cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_cpi_accounts,
+        );
+        anchor_spl::token::transfer(transfer_cpi_ctx, 1)?;
+
+        stake_pool.total_staked += 1;
+
+        msg!(
+            "NFT staked: {} with multiplier {}",
+            ctx.accounts.nft_mint.key(),
+            nft_type.stake_multiplier
+        );
+        Ok(())
+    }
+
+    // Staking: Unstake NFT and claim all pending rewards
+    pub fn unstake_nft(ctx: Context<UnstakeNFT>) -> Result<()> {
+        let stake_account = &ctx.accounts.stake_account;
+
+        require!(stake_account.owner == ctx.accounts.staker.key(), ErrorCode::Unauthorized);
+
+        let clock = Clock::get()?;
+
+        // Calculate and transfer pending rewards
+        let time_staked = clock.unix_timestamp.saturating_sub(stake_account.last_claim_timestamp);
+        let reward_rate_per_second = ctx.accounts.stake_pool.reward_rate_per_second;
+        let base_rewards = (time_staked as u64)
+            .saturating_mul(reward_rate_per_second);
+        let rewards = base_rewards
+            .saturating_mul(stake_account.stake_multiplier)
+            .saturating_div(10000); // Divide by 10000 because multiplier is in basis points
+
+        let pool_bump = ctx.accounts.stake_pool.bump;
+        if rewards > 0 {
+            let pool_seeds = &[
+                b"stake_pool".as_ref(),
+                &[pool_bump],
+            ];
+            let signer = &[&pool_seeds[..]];
+
+            let transfer_cpi_accounts = anchor_spl::token::Transfer {
+                from: ctx.accounts.reward_token_vault.to_account_info(),
+                to: ctx.accounts.staker_reward_token_account.to_account_info(),
+                authority: ctx.accounts.stake_pool.to_account_info(),
+            };
+            let transfer_cpi_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                transfer_cpi_accounts,
+                signer,
+            );
+            anchor_spl::token::transfer(transfer_cpi_ctx, rewards)?;
+        }
+
+        // Transfer NFT back from vault to staker
+        let nft_mint_key = stake_account.nft_mint;
+        let staker_key = ctx.accounts.staker.key();
+        let stake_account_seeds = &[
+            b"stake_account",
+            staker_key.as_ref(),
+            nft_mint_key.as_ref(),
+            &[stake_account.bump],
+        ];
+        let signer = &[&stake_account_seeds[..]];
+
+        let nft_transfer_cpi_accounts = anchor_spl::token::Transfer {
+            from: ctx.accounts.vault_nft_token_account.to_account_info(),
+            to: ctx.accounts.staker_nft_token_account.to_account_info(),
+            authority: ctx.accounts.stake_account.to_account_info(),
+        };
+        let nft_transfer_cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            nft_transfer_cpi_accounts,
+            signer,
+        );
+        anchor_spl::token::transfer(nft_transfer_cpi_ctx, 1)?;
+
+        ctx.accounts.stake_pool.total_staked = ctx.accounts.stake_pool.total_staked.saturating_sub(1);
+
+        msg!(
+            "NFT unstaked: {}, rewards claimed: {}",
+            nft_mint_key,
+            rewards
+        );
+        Ok(())
+    }
+
+    // Staking: Claim rewards without unstaking
+    pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+        let stake_account = &mut ctx.accounts.stake_account;
+        let stake_pool = &ctx.accounts.stake_pool;
+
+        require!(stake_account.owner == ctx.accounts.staker.key(), ErrorCode::Unauthorized);
+
+        let clock = Clock::get()?;
+
+        // Calculate rewards since last claim
+        let time_since_last_claim = clock.unix_timestamp.saturating_sub(stake_account.last_claim_timestamp);
+        let base_rewards = (time_since_last_claim as u64)
+            .saturating_mul(stake_pool.reward_rate_per_second);
+        let rewards = base_rewards
+            .saturating_mul(stake_account.stake_multiplier)
+            .saturating_div(10000); // Divide by 10000 because multiplier is in basis points
+
+        if rewards > 0 {
+            let pool_seeds = &[
+                b"stake_pool".as_ref(),
+                &[stake_pool.bump],
+            ];
+            let signer = &[&pool_seeds[..]];
+
+            let transfer_cpi_accounts = anchor_spl::token::Transfer {
+                from: ctx.accounts.reward_token_vault.to_account_info(),
+                to: ctx.accounts.staker_reward_token_account.to_account_info(),
+                authority: ctx.accounts.stake_pool.to_account_info(),
+            };
+            let transfer_cpi_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                transfer_cpi_accounts,
+                signer,
+            );
+            anchor_spl::token::transfer(transfer_cpi_ctx, rewards)?;
+
+            // Update last claim timestamp
+            stake_account.last_claim_timestamp = clock.unix_timestamp;
+
+            msg!("Rewards claimed: {}", rewards);
+        } else {
+            msg!("No rewards to claim");
+        }
+
+        Ok(())
+    }
 }
 
 // Account Structures
@@ -601,6 +784,7 @@ pub struct CreateNFTType<'info> {
             + 32
             + 4 + type_name.len()
             + 4 + 200
+            + 8
             + 8
             + 8
             + 8
@@ -883,6 +1067,7 @@ pub struct NftType {
     pub price: u64,
     pub max_supply: u64,
     pub current_supply: u64,
+    pub stake_multiplier: u64, // Multiplier for staking rewards (basis points, e.g., 10000 = 1x)
     pub bump: u8,
 }
 
@@ -915,6 +1100,52 @@ impl Room {
 	}
 }
 
+#[account]
+pub struct StakePool {
+    pub admin: Pubkey,
+    pub reward_token_mint: Pubkey,
+    pub reward_rate_per_second: u64,
+    pub total_staked: u64,
+    pub bump: u8,
+}
+
+impl StakePool {
+    pub fn space() -> usize {
+        8 + // discriminator
+        32 + // admin
+        32 + // reward_token_mint
+        8 + // reward_rate_per_second
+        8 + // total_staked
+        1 // bump
+    }
+}
+
+#[account]
+pub struct StakeAccount {
+    pub owner: Pubkey,
+    pub nft_mint: Pubkey,
+    pub nft_type: Pubkey,
+    pub stake_pool: Pubkey,
+    pub stake_timestamp: i64,
+    pub last_claim_timestamp: i64,
+    pub stake_multiplier: u64,
+    pub bump: u8,
+}
+
+impl StakeAccount {
+    pub fn space() -> usize {
+        8 + // discriminator
+        32 + // owner
+        32 + // nft_mint
+        32 + // nft_type
+        32 + // stake_pool
+        8 + // stake_timestamp
+        8 + // last_claim_timestamp
+        8 + // stake_multiplier
+        1 // bump
+    }
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
 pub enum RoomStatus {
 	Waiting = 0,
@@ -944,6 +1175,14 @@ pub enum ErrorCode {
     PresaleEnded,
     #[msg("Presale cannot be ended yet")]
     PresaleNotEnded,
+    #[msg("Invalid stake multiplier")]
+    InvalidStakeMultiplier,
+    #[msg("NFT not staked")]
+    NFTNotStaked,
+    #[msg("NFT already staked")]
+    NFTAlreadyStaked,
+    #[msg("Invalid NFT mint")]
+    InvalidNFTMint,
 }
 
 // Accounts for presale
@@ -1000,4 +1239,208 @@ pub struct RestartPresale<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
+}
+
+// Staking Accounts
+#[derive(Accounts)]
+pub struct InitializeStakePool<'info> {
+    #[account(
+        init,
+        payer = admin,
+        space = StakePool::space(),
+        seeds = [b"stake_pool"],
+        bump
+    )]
+    pub stake_pool: Account<'info, StakePool>,
+
+    /// CHECK: Reward token mint - validated in handler
+    pub reward_token_mint: Account<'info, Mint>,
+
+    #[account(
+        init,
+        payer = admin,
+        token::mint = reward_token_mint,
+        token::authority = stake_pool,
+        seeds = [b"reward_vault"],
+        bump
+    )]
+    pub reward_token_vault: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct StakeNFT<'info> {
+    #[account(
+        mut,
+        seeds = [b"stake_pool"],
+        bump = stake_pool.bump
+    )]
+    pub stake_pool: Account<'info, StakePool>,
+
+    #[account(
+        init,
+        payer = staker,
+        space = StakeAccount::space(),
+        seeds = [b"stake_account", staker.key().as_ref(), nft_mint.key().as_ref()],
+        bump
+    )]
+    pub stake_account: Account<'info, StakeAccount>,
+
+    #[account(
+        seeds = [b"collection", collection.name.as_bytes()],
+        bump = collection.bump,
+    )]
+    pub collection: Account<'info, NFTCollection>,
+
+    #[account(
+        seeds = [b"type", collection.key().as_ref(), nft_type.name.as_bytes()],
+        bump = nft_type.bump,
+    )]
+    pub nft_type: Account<'info, NftType>,
+
+    /// CHECK: NFT mint
+    pub nft_mint: Account<'info, Mint>,
+
+    /// CHECK: NFT Metadata account
+    #[account(
+        seeds = [
+            b"metadata",
+            token_metadata_program.key().as_ref(),
+            nft_mint.key().as_ref(),
+        ],
+        bump,
+        seeds::program = token_metadata_program.key(),
+    )]
+    pub nft_metadata: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        constraint = staker_nft_token_account.owner == staker.key(),
+        constraint = staker_nft_token_account.mint == nft_mint.key(),
+        constraint = staker_nft_token_account.amount >= 1,
+    )]
+    pub staker_nft_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = staker,
+        token::mint = nft_mint,
+        token::authority = stake_account,
+        seeds = [b"vault", nft_mint.key().as_ref()],
+        bump
+    )]
+    pub vault_nft_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub staker: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    /// CHECK: Token Metadata Program
+    pub token_metadata_program: UncheckedAccount<'info>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct UnstakeNFT<'info> {
+    #[account(
+        mut,
+        seeds = [b"stake_pool"],
+        bump = stake_pool.bump
+    )]
+    pub stake_pool: Account<'info, StakePool>,
+
+    #[account(
+        mut,
+        close = staker,
+        seeds = [b"stake_account", staker.key().as_ref(), stake_account.nft_mint.as_ref()],
+        bump = stake_account.bump,
+    )]
+    pub stake_account: Account<'info, StakeAccount>,
+
+    /// CHECK: Reward token mint from stake pool
+    pub reward_token_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [b"reward_vault"],
+        bump,
+        constraint = reward_token_vault.mint == reward_token_mint.key(),
+    )]
+    pub reward_token_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = staker,
+        associated_token::mint = reward_token_mint,
+        associated_token::authority = staker,
+    )]
+    pub staker_reward_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", stake_account.nft_mint.as_ref()],
+        bump,
+    )]
+    pub vault_nft_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = staker_nft_token_account.owner == staker.key(),
+        constraint = staker_nft_token_account.mint == stake_account.nft_mint,
+    )]
+    pub staker_nft_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut, constraint = staker.key() == stake_account.owner)]
+    pub staker: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimRewards<'info> {
+    #[account(
+        seeds = [b"stake_pool"],
+        bump = stake_pool.bump
+    )]
+    pub stake_pool: Account<'info, StakePool>,
+
+    #[account(
+        mut,
+        seeds = [b"stake_account", staker.key().as_ref(), stake_account.nft_mint.as_ref()],
+        bump = stake_account.bump,
+    )]
+    pub stake_account: Account<'info, StakeAccount>,
+
+    /// CHECK: Reward token mint from stake pool
+    pub reward_token_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [b"reward_vault"],
+        bump,
+        constraint = reward_token_vault.mint == reward_token_mint.key(),
+    )]
+    pub reward_token_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = staker,
+        associated_token::mint = reward_token_mint,
+        associated_token::authority = staker,
+    )]
+    pub staker_reward_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub staker: Signer<'info>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub rent: Sysvar<'info, Rent>,
 }
